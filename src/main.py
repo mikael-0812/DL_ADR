@@ -1,5 +1,6 @@
 import dgl
 import numpy as np
+import pandas as pd
 import torch
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
@@ -12,6 +13,39 @@ from dgllife.utils import (
     AttentiveFPAtomFeaturizer,
     AttentiveFPBondFeaturizer
 )
+
+from sklearn.model_selection import train_test_split
+
+def split_dataset(df, seed=42,
+                  train_ratio=0.7,
+                  val_ratio=0.15,
+                  test_ratio=0.15):
+
+    assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-6
+
+    # Train + temp
+    train_df, temp_df = train_test_split(
+        df,
+        test_size=(1 - train_ratio),
+        random_state=seed,
+        shuffle=True,
+        stratify=df["LABEL"],   # giữ phân bố label đều nhau
+    )
+
+    # temp -> val + test
+    val_df, test_df = train_test_split(
+        temp_df,
+        test_size=(test_ratio / (test_ratio + val_ratio)),
+        random_state=seed,
+        shuffle=True,
+        stratify=temp_df["LABEL"]
+    )
+
+    print("Train:", len(train_df))
+    print("Val:", len(val_df))
+    print("Test:", len(test_df))
+
+    return train_df, val_df, test_df
 
 ADR_CHARS = list(string.ascii_letters + string.digits + "-_'()[]+/ ")
 ADR_STOI = {c: i+1 for i, c in enumerate(ADR_CHARS)}  # 0 = PAD
@@ -74,6 +108,9 @@ class DrugADRDataset(Dataset):
         label = torch.tensor([float(row["LABEL"])], dtype=torch.float32)
 
         return g, torch.tensor(ids), torch.tensor(mask), label
+
+data = pd.read_csv("Dataset/ADR_with_SMILES_label.csv")
+train_df, val_df, test_df = split_dataset(data)
 
 train_loader = DataLoader(
     DrugADRDataset(train_df),
