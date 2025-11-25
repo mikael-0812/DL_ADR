@@ -1,204 +1,82 @@
-import math
+
+import string
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+import dgl
+from dgllife.utils import (
+    smiles_to_bigraph,
+    AttentiveFPAtomFeaturizer,
+    AttentiveFPBondFeaturizer,
+)
 
-# ============ BERT-Style Self-Attention ============
+import pandas as pd
 
-class BertSelfAttention(nn.Module):
-    def __init__(self, hidden_size, num_heads, dropout=0.1):
-        super().__init__()
-        assert hidden_size % num_heads == 0
+# ===== ADR tokenizer (char-level) =====
+ADR_CHARS = list(string.ascii_letters + string.digits + "-_'()[]+/ " )
+ADR_STOI = {c: i+1 for i, c in enumerate(ADR_CHARS)}  # 0 = PAD
+ADR_ITOS = {i+1: c for i, c in enumerate(ADR_CHARS)}
+ADR_MAX_LEN = 32
 
-        self.hidden_size = hidden_size
-        self.num_heads = num_heads
-        self.head_dim = hidden_size // num_heads
-
-        self.query = nn.Linear(hidden_size, hidden_size)
-        self.key   = nn.Linear(hidden_size, hidden_size)
-        self.value = nn.Linear(hidden_size, hidden_size)
-
-        self.dropout = nn.Dropout(dropout)
-
-    def transpose_for_scores(self, x):
-        # x: (B, L, H) -> (B, heads, L, head_dim)
-        B, L, H = x.size()
-        x = x.view(B, L, self.num_heads, self.head_dim)
-        return x.permute(0, 2, 1, 3)
-
-    def forward(self, hidden_states, attention_mask=None):
-        # Linear projections
-        Q = self.query(hidden_states)
-        K = self.key(hidden_states)
-        V = self.value(hidden_states)
-
-        # Split heads
-        Q = self.transpose_for_scores(Q)
-        K = self.transpose_for_scores(K)
-        V = self.transpose_for_scores(V)
-
-        # Scaled dot-product attention
-        scores = torch.matmul(Q, K.transpose(-1, -2)) / math.sqrt(self.head_dim)
-        if attention_mask is not None:
-            scores = scores + attention_mask  # (B, 1, 1, L)
-
-        probs = torch.softmax(scores, dim=-1)
-        probs = self.dropout(probs)
-
-        context = torch.matmul(probs, V)  # (B, heads, L, head_dim)
-        context = context.permute(0, 2, 1, 3).contiguous()
-        context = context.view(context.size(0), context.size(1), self.hidden_size)
-        return context
+def tokenize_adr(text: str):
+    text = (text or "").lower().strip()
+    text = text[:ADR_MAX_LEN]
+    ids = [ADR_STOI.get(c, 0) for c in text]
+    if len(ids) < ADR_MAX_LEN:
+        ids += [0] * (ADR_MAX_LEN - len(ids))
+    mask = [1 if t != 0 else 0 for t in ids]
+    return torch.tensor(ids, dtype=torch.long), torch.tensor(mask, dtype=torch.long)
 
 
-class BertIntermediate(nn.Module):
-    def __init__(self, hidden_size, intermediate_size):
-        super().__init__()
-        self.dense = nn.Linear(hidden_size, intermediate_size)
-        self.act   = nn.GELU()
+# ===== SMILES → DGL graph (AttentiveFP) =====
+atom_ftr = AttentiveFPAtomFeaturizer()
+bond_ftr = AttentiveFPBondFeaturizer(self_loop=False)
 
-    def forward(self, x):
-        return self.act(self.dense(x))
-
-
-class BertOutput(nn.Module):
-    def __init__(self, input_size, hidden_size, dropout=0.1):
-        super().__init__()
-        self.dense   = nn.Linear(input_size, hidden_size)
-        self.dropout = nn.Dropout(dropout)
-        self.norm    = nn.LayerNorm(hidden_size, eps=1e-12)
-
-    def forward(self, x, residual):
-        x = self.dense(x)
-        x = self.dropout(x)
-        return self.norm(x + residual)   # residual + LN
+def smiles_to_graph(smiles: str):
+    g = smiles_to_bigraph(
+        smiles,
+        node_featurizer=atom_ftr,
+        edge_featurizer=bond_ftr,
+        add_self_loop=False
+    )
+    g.ndata["h"] = g.ndata["h"].float()
+    return g
 
 
-class BertLayer(nn.Module):
-    def __init__(self, hidden_size, intermediate_size, num_heads, dropout=0.1):
-        super().__init__()
-        self.self_attn      = BertSelfAttention(hidden_size, num_heads, dropout)
-        self.self_output    = BertOutput(hidden_size, hidden_size, dropout)
-        self.intermediate   = BertIntermediate(hidden_size, intermediate_size)
-        self.intermediate_o = BertOutput(intermediate_size, hidden_size, dropout)
+# ===== Dataset =====
 
-    def forward(self, hidden_states, attention_mask=None):
-        # Self-attention
-        attn_out = self.self_attn(hidden_states, attention_mask)
-        attn_out = self.self_output(attn_out, hidden_states)
+class DrugADRDataset(Dataset):
+    def __init__(self, df: pd.DataFrame):
+        self.df = df.reset_index(drop=True)
 
-        # FFN
-        inter = self.intermediate(attn_out)
-        out   = self.intermediate_o(inter, attn_out)
-        return out
+    def __len__(self):
+        return len(self.df)
 
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        smi = row["SMILES"]
+        adr = row["ADR_TERM"]
+        label = float(row["LABEL"])
 
-class BertEncoder(nn.Module):
-    def __init__(self, num_layers, hidden_size, intermediate_size, num_heads, dropout=0.1):
-        super().__init__()
-        self.layers = nn.ModuleList([
-            BertLayer(hidden_size, intermediate_size, num_heads, dropout)
-            for _ in range(num_layers)
-        ])
+        try:
+            g = smiles_to_graph(smi)
+            if g is None:
+                # skip invalid sample or assign placeholder graph
+                return self.__getitem__((idx + 1) % len(self.df))
 
-    def forward(self, hidden_states, attention_mask=None):
-        for layer in self.layers:
-            hidden_states = layer(hidden_states, attention_mask)
-        return hidden_states
+        except Exception as e:
+            print("Bad SMILES:", smi)
+            raise e
+
+        adr_ids, adr_mask = tokenize_adr(adr)
+        y = torch.tensor(label, dtype=torch.float32)
+
+        return g, adr_ids, adr_mask, y
 
 
-# ============ Bi-Directional Cross-Attention (Drug ↔ SE) ============
-
-class BiDirectionalCrossAttention(nn.Module):
-    def __init__(self, hidden_size, num_heads, dropout=0.1):
-        super().__init__()
-        assert hidden_size % num_heads == 0
-
-        self.hidden_size = hidden_size
-        self.num_heads   = num_heads
-        self.head_dim    = hidden_size // num_heads
-
-        # Drug → SE
-        self.Q_drug = nn.Linear(hidden_size, hidden_size)
-        self.K_se   = nn.Linear(hidden_size, hidden_size)
-        self.V_se   = nn.Linear(hidden_size, hidden_size)
-
-        # SE → Drug
-        self.Q_se   = nn.Linear(hidden_size, hidden_size)
-        self.K_drug = nn.Linear(hidden_size, hidden_size)
-        self.V_drug = nn.Linear(hidden_size, hidden_size)
-
-        self.dropout   = nn.Dropout(dropout)
-        self.out_drug  = nn.Linear(hidden_size, hidden_size)
-        self.out_se    = nn.Linear(hidden_size, hidden_size)
-
-        self.norm_drug = nn.LayerNorm(hidden_size, eps=1e-12)
-        self.norm_se   = nn.LayerNorm(hidden_size, eps=1e-12)
-
-    def _split_heads(self, x):
-        B, L, H = x.size()
-        x = x.view(B, L, self.num_heads, self.head_dim)
-        return x.permute(0, 2, 1, 3)
-
-    def _merge_heads(self, x):
-        B, heads, L, dim = x.size()
-        x = x.permute(0, 2, 1, 3).contiguous()
-        return x.view(B, L, heads * dim)
-
-    def _attend(self, Q, K, V, mask):
-        Q = self._split_heads(Q)
-        K = self._split_heads(K)
-        V = self._split_heads(V)
-        scores = torch.matmul(Q, K.transpose(-1, -2)) / math.sqrt(self.head_dim)
-        if mask is not None:
-            scores = scores + mask   # (B,1,1,L_k)
-        probs = torch.softmax(scores, dim=-1)
-        probs = self.dropout(probs)
-        context = torch.matmul(probs, V)
-        context = self._merge_heads(context)
-        return context
-
-    def forward(self, drug, se, drug_mask=None, se_mask=None):
-        # Drug attends to SE
-        Qd = self.Q_drug(drug)
-        Ke = self.K_se(se)
-        Ve = self.V_se(se)
-        drug_ctx = self._attend(Qd, Ke, Ve, se_mask)
-        drug_out = self.out_drug(drug_ctx)
-        drug_out = self.norm_drug(drug_out + drug)  # residual
-
-        # SE attends to Drug
-        Qe = self.Q_se(se)
-        Kd = self.K_drug(drug)
-        Vd = self.V_drug(drug)
-        se_ctx = self._attend(Qe, Kd, Vd, drug_mask)
-        se_out = self.out_se(se_ctx)
-        se_out = self.norm_se(se_out + se)
-
-        return drug_out, se_out
-
-
-class BiCrossAttention(nn.Module):
-    def __init__(self, hidden_size, num_heads=4, dropout=0.1):
-        super().__init__()
-        self.attn_drug_to_se = BertSelfAttention(hidden_size, num_heads, dropout)
-        self.attn_se_to_drug = BertSelfAttention(hidden_size, num_heads, dropout)
-
-        self.output_d = BertOutput(hidden_size, hidden_size, dropout)
-        self.output_s = BertOutput(hidden_size, hidden_size, dropout)
-
-    def forward(self, drug_seq, se_seq, drug_mask, se_mask):
-        # masks
-        drug_attn_mask = (1 - drug_mask).unsqueeze(1).unsqueeze(2) * -10000.0
-        se_attn_mask   = (1 - se_mask).unsqueeze(1).unsqueeze(2) * -10000.0
-
-        # drug attends to SE
-        drug2se = self.attn_drug_to_se(drug_seq, se_attn_mask)
-        drug_out = self.output_d(drug2se, drug_seq)
-
-        # SE attends to Drug
-        se2drug = self.attn_se_to_drug(se_seq, drug_attn_mask)
-        se_out = self.output_s(se2drug, se_seq)
-
-        return drug_out, se_out
-
+def collate_fn(samples):
+    graphs, adr_ids, adr_masks, labels = map(list, zip(*samples))
+    bg = dgl.batch(graphs)
+    adr_ids  = torch.stack(adr_ids, dim=0)
+    adr_masks = torch.stack(adr_masks, dim=0)
+    labels   = torch.stack(labels, dim=0)
+    return bg, adr_ids, adr_masks, labels
