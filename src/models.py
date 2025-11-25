@@ -1,10 +1,59 @@
 import torch
 import torch.nn as nn
 
-from src.layers import BertEncoder
+from encoder import DrugEncoder, SEEncoder
+from src.layers import BertEncoder, BiCrossAttention
 from src.utils import SimpleAttentiveFPGNN
 
+class DrugSEFusionTransformer(nn.Module):
+    def __init__(
+        self,
+        node_feat_dim,
+        vocab_size,
+        hidden_size=200
+    ):
+        super().__init__()
 
+        self.drug_encoder = DrugEncoder(
+            node_feat_dim=node_feat_dim,
+            trans_hidden_dim=hidden_size
+        )
+
+        self.se_encoder = SEEncoder(
+            vocab_size=vocab_size,
+            hidden_size=hidden_size
+        )
+
+        self.cross = BiCrossAttention(hidden_size, num_heads=4)
+
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_size * 2, 256),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(256, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, bg, se_ids, se_mask):
+        # Drug → GNN → Transformer
+        drug_seq, drug_repr, drug_mask = self.drug_encoder(bg)
+
+        # SE → Transformer
+        se_seq, se_repr, se_mask = self.se_encoder(se_ids, se_mask)
+
+        # Cross Attention Fusion
+        drug_fused, se_fused = self.cross(drug_seq, se_seq, drug_mask, se_mask)
+
+        # Final pooled vectors
+        drug_final = drug_fused.mean(1)
+        se_final = se_fused.mean(1)
+
+        # Fusion
+        fused = torch.cat([drug_final, se_final], dim=1)
+
+        # Classification
+        out = self.classifier(fused)
+        return out
 class GNN2TransformerEncoder(nn.Module):
     """
     Pipeline:
