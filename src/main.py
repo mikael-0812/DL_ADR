@@ -4,8 +4,6 @@ import pandas as pd
 import torch
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
-from src.encoder import DrugEncoder, SEEncoder
-from src.layers import BiCrossAttention, DrugSEFusionTransformer
 from sklearn.metrics import roc_auc_score, average_precision_score
 import string
 from dgllife.utils import (
@@ -13,9 +11,10 @@ from dgllife.utils import (
     AttentiveFPAtomFeaturizer,
     AttentiveFPBondFeaturizer
 )
-
-
 from sklearn.model_selection import train_test_split
+
+from src.models import DrugSEFusionTransformer
+
 
 def split_dataset(df, seed=42,
                   train_ratio=0.7,

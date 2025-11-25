@@ -1,18 +1,13 @@
-# Default ignored files
-/shelf/
-/workspace.xml
-# Editor-based HTTP Client requests
-/httpRequests/
-# Datasource local storage ignored files
-/dataSources/
-/dataSources.local.xml
 # Ignore everything
 *
 
-# But not these folders
+# Allow only these folders
 !src/
 !Dataset/
-
-# Optional: ignore hidden system files (OneDrive, VSCode, etc.)
+!requirement.txt
 !.gitignore
-!.gitattributes
+
+# Ignore IDE & config folders
+.vscode/
+.idea/
+
