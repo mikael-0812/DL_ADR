@@ -1,7 +1,7 @@
 import torch
 from torch import nn
 
-from layers import BertEncoder
+
 from utils import SimpleAttentiveFPGNN
 
 
@@ -18,7 +18,7 @@ class GNN2TransformerEncoder(nn.Module):
 
     def __init__(
         self,
-        node_feat_dim,          # dim của node feature đầu vào (vd từ AttentiveFPAtomFeaturizer)
+        node_feat_dim,
         gnn_hidden_dim=128,
         gnn_layers=3,
         gnn_timesteps=2,

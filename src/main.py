@@ -114,7 +114,7 @@ def evaluate(model, loader, device, desc="Eval"):
 
 
 def main():
-    data_path = "D:\IT\OneDrive - Hanoi University of Science and Technology\Documents\HUST\Deep Learning\ADR_DL_Project\Dataset\ADR_with_SMILES_label.csv"  # chỉnh đường dẫn file CSV của bạn
+    data_path = "D:\IT\OneDrive - Hanoi University of Science and Technology\Documents\HUST\Deep Learning\ADR_DL_Project\Dataset\ADR_with_SMILES_label.csv"
     df = pd.read_csv(data_path)
     df = df[df.SMILES.apply(lambda x: Chem.MolFromSmiles(str(x)) is not None)]
     df = df.reset_index(drop=True)
