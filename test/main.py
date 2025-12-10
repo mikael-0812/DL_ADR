@@ -1,15 +1,13 @@
+import numpy as np
 import torch
 import torch.nn.functional as F
 import pandas as pd
+from sklearn.cluster import KMeans
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
 from chem.model import TokenMAE
-from models import DrugEncoderSimSGT, ADRTextEncoder, ADRSeverityModel
+from models import DrugEncoderSimSGT, ADRTextEncoder, ADRSeverityModel, smiles2graph
 
-
-# ============================================================
-# 1. Dummy args để mô hình hoạt động (vì checkpoint không chứa args)
-# ============================================================
 class DummyArgs:
     def __init__(self):
         # GNN parameters
@@ -72,7 +70,7 @@ def make_dummy_args():
 # ============================================================
 # 2. Hàm load pretrained SimSGT (m35_ckt.pt)
 # ============================================================
-def load_simsgt_model(checkpoint_path="/content/SimSGT/chem/checkpoints/m35_ckt.pt"):
+def load_simsgt_model(checkpoint_path="chem/checkpoints/m35_ckt.pt"):
 
     args = make_dummy_args()
 
@@ -113,90 +111,111 @@ def load_simsgt_model(checkpoint_path="/content/SimSGT/chem/checkpoints/m35_ckt.
     model.eval()
     return model
 
-class SmilesADRFreqDataset(Dataset):
-    def __init__(self, csv_path):
-        df = pd.read_csv(csv_path)
-        self.smiles = df["SMILES"].astype(str).tolist()
-        self.adr = df["ADR_TERM"].astype(str).tolist()
-        # LABEL ∈ {1,...,5} → chuyển về {0,...,4} cho CrossEntropy
-        self.labels = (df["LABEL"].astype(int) - 1).tolist()
+@torch.no_grad()
+def extract_simsgt_tokens(smiles, model):
+    """
+    Trích token sau Transformer Encoder
+    """
+    data = smiles2graph(smiles)
+    data.batch = torch.zeros(data.num_nodes, dtype=torch.long)
+    data.mask_tokens = torch.zeros(data.num_nodes, dtype=torch.bool)
+    data.x_masked = data.x.clone()
 
-    def __len__(self):
-        return len(self.smiles)
+    # 1) Tokenizer → GNN
+    h = model.tokenizer(data.x_masked, data.edge_index, data.edge_attr)
 
-    def __getitem__(self, idx):
-        return self.smiles[idx], self.adr[idx], self.labels[idx]
+    # 2) Position encoding
+    pe = model.pos_encoder(data)
 
-def collate_fn(batch):
-    smiles_list = [b[0] for b in batch]
-    adr_list = [b[1] for b in batch]
-    labels = torch.tensor([b[2] for b in batch], dtype=torch.long)
-    return smiles_list, adr_list, labels
-
-import torch
-import torch.nn.functional as F
-from torch.optim import Adam
-
-def main():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    # 1) Load SimSGT pretrained
-    simsgt_model = load_simsgt_model()  # dùng hàm bạn đã có
-    drug_encoder = DrugEncoderSimSGT(simsgt_model, d_token=300, d_mil_att=128, device=device)
-
-    # 2) ADR encoder (BERT)
-    adr_encoder = ADRTextEncoder("emilyalsentzer/Bio_ClinicalBERT").to(device)
-
-    # 3) Model cuối
-    model = ADRSeverityModel(
-        drug_encoder=drug_encoder,
-        adr_encoder=adr_encoder,
-        d_hidden=256,
-        n_classes=5,
-        device=device
-    ).to(device)
-
-    # 4) Dataset + Dataloader
-    train_dataset = SmilesADRFreqDataset("data.csv")
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=16,
-        shuffle=True,
-        collate_fn=collate_fn
+    # 3) Transformer encoder (contextualized token)
+    h = model.encoder(
+        F.relu(h),
+        data.edge_index,
+        data.edge_attr,
+        data.batch,
+        data.mask_tokens,
+        pe
     )
 
-    optimizer = Adam(model.parameters(), lr=1e-4)
-    criterion = nn.CrossEntropyLoss()
+    # h shape = (num_nodes, 300)
+    return h
 
-    model.train()
-    for epoch in range(2):  # demo 2 epoch
-        total_loss = 0.0
-        for smiles_batch, adr_batch, labels in train_loader:
-            labels = labels.to(device)
+def collect_all_embeddings(smiles_list, model):
+    embeds = []
+    node_map = []   # giữ track node → (smiles, node_index)
 
-            # forward
-            logits = model(smiles_batch, adr_batch)  # (B, 5)
-            loss = criterion(logits, labels)
+    for smi in smiles_list:
+        h = extract_simsgt_tokens(smi, model)
+        embeds.append(h)
+        for i in range(h.shape[0]):
+            node_map.append((smi, i))
 
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+    embeds = torch.cat(embeds, dim=0)   # [N_total_nodes, 300]
+    return embeds, node_map
 
-            total_loss += loss.item() * labels.size(0)
+def build_codebook(all_embeds, n_clusters=128):
+    km = KMeans(
+        n_clusters=n_clusters,
+        random_state=0,
+        n_init="auto"
+    )
+    km.fit(all_embeds.numpy())
 
-        avg_loss = total_loss / len(train_dataset)
-        print(f"Epoch {epoch+1}: loss = {avg_loss:.4f}")
+    centers = torch.tensor(km.cluster_centers_, dtype=torch.float32)
+    return km, centers
 
-    # 5) Test nhanh 1 sample
-    model.eval()
-    test_smi = ["CCN(CC)CC"]
-    test_adr = ["rash"]
-    with torch.no_grad():
-        logits = model(test_smi, test_adr)
-        probs = F.softmax(logits, dim=-1)
-        pred_cls = probs.argmax(dim=-1).item()  # 0..4
-    print("Pred class (0-based):", pred_cls, "→ severity =", pred_cls + 1)
+def molecule_to_vector(smiles, model, km):
+    tokens = extract_simsgt_tokens(smiles, model)   # [n_nodes, 300]
 
+    labels = km.predict(tokens.numpy())
+    n_clusters = km.n_clusters
+
+    vec = np.bincount(labels, minlength=n_clusters)
+    vec = vec / (vec.sum() + 1e-6)   # chuẩn hóa thành phân phối
+
+    return vec
+
+
+from rdkit import Chem
+from rdkit.Chem import Draw
+
+
+def visualize_cluster_center(cluster_id, centers, embeds, node_map, top_k=1):
+    center = centers[cluster_id]  # 300-d
+
+    dists = torch.norm(embeds - center, dim=1)  # N distances
+    top_idx = torch.topk(dists, k=top_k, largest=False).indices
+
+    figs = []
+    for idx in top_idx:
+        smi, node_id = node_map[idx]
+        mol = Chem.MolFromSmiles(smi)
+        atom_list = [node_id]
+        img = Draw.MolToImage(mol, highlightAtoms=atom_list)
+        figs.append(img)
+
+    return figs
 
 if __name__ == "__main__":
-    main()
+    model = load_simsgt_model()
+
+    smiles_list = [
+        "CCO",
+        "CCN(CC)CC",
+        "c1ccccc1"
+    ]
+
+    print("Collecting contextualized tokens…")
+    all_tokens, node_map = collect_all_embeddings(smiles_list, model)
+
+    print("Building KMeans codebook…")
+    km, centers = build_codebook(all_tokens, n_clusters=32)
+
+    print("Embedding molecules…")
+    for smi in smiles_list:
+        vec = molecule_to_vector(smi, model, km)
+        print(smi, vec[:10], "...")
+
+    print("Visualizing cluster 0:")
+    imgs = visualize_cluster_center(0, centers, all_tokens, node_map)
+    imgs[0].show()
